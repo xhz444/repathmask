@@ -39,11 +39,11 @@ jobs:
         CONFIG_KSU=m CC=clang make
         echo "=== Build completed ==="
 
-        mkdir -p /github/workspace/out
+        mkdir -p ../out
         OUTPUT_NAME="${{ matrix.kmi }}_pkgmask.ko"
-        cp pkgmask.ko "/github/workspace/out/$OUTPUT_NAME"
-        llvm-strip -d "/github/workspace/out/$OUTPUT_NAME"
-        echo "Size after stripping: $(du -h "/github/workspace/out/$OUTPUT_NAME" | cut -f1)"
+        cp pkgmask.ko "../out/$OUTPUT_NAME"
+        llvm-strip -d "../out/$OUTPUT_NAME"
+        echo "Size after stripping: $(du -h "../out/$OUTPUT_NAME" | cut -f1)"
 
     - name: Package KernelSU zip
       run: |
@@ -55,7 +55,7 @@ jobs:
       uses: actions/upload-artifact@v7
       with:
         name: pkgmask-${{ matrix.kmi }}
-        path: /github/workspace/out/*
+        path: out/*
 
   release:
     name: Publish release (tags only)
