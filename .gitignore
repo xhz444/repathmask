@@ -1,0 +1,6 @@
+out/
+*.ko
+*.o
+.*.cmd
+Module.symvers
+modules.order

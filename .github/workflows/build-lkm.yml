@@ -1,0 +1,83 @@
+name: Build PkgMask KernelSU Module
+
+on:
+  push:
+    branches:
+      - main
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-lkm:
+    name: Build pkgmask.ko (${{ matrix.kmi }})
+    strategy:
+      matrix:
+        # 按需增删 KMI：android12-5.10 / android13-5.10 / android13-5.15 /
+        # android14-5.15 / android14-6.1 / android15-6.6 / android16-6.12
+        kmi:
+          - android14-6.1
+          - android15-6.6
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/ylarod/ddk-min:${{ matrix.kmi }}-20260313
+      options: --privileged
+
+    steps:
+    - name: Checkout source code
+      uses: actions/checkout@v6
+
+    - name: Build pkgmask.ko
+      run: |
+        cd kernel
+
+        echo "=== Building pkgmask.ko for KMI: ${{ matrix.kmi }} ==="
+        CONFIG_KSU=m CC=clang make
+        echo "=== Build completed ==="
+
+        mkdir -p /github/workspace/out
+        OUTPUT_NAME="${{ matrix.kmi }}_pkgmask.ko"
+        cp pkgmask.ko "/github/workspace/out/$OUTPUT_NAME"
+        llvm-strip -d "/github/workspace/out/$OUTPUT_NAME"
+        echo "Size after stripping: $(du -h "/github/workspace/out/$OUTPUT_NAME" | cut -f1)"
+
+    - name: Package KernelSU zip
+      run: |
+        NO_UPDATE_JSON=1 sh ./tools/package_ksu.sh \
+          "out/${{ matrix.kmi }}_pkgmask.ko" \
+          "out/PkgMask-${{ matrix.kmi }}.zip"
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v7
+      with:
+        name: pkgmask-${{ matrix.kmi }}
+        path: /github/workspace/out/*
+
+  release:
+    name: Publish release (tags only)
+    needs: build-lkm
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: release-assets
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p release-upload
+          find release-assets -type f -name '*.zip' -exec cp {} release-upload/ \;
+          find release-assets -type f -name '*_pkgmask.ko' -exec cp {} release-upload/ \;
+          ls -la release-upload
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "PkgMask ${GITHUB_REF_NAME}" \
+            --notes "Automated PkgMask build for ${GITHUB_SHA}." \
+            release-upload/* || \
+          gh release upload "${GITHUB_REF_NAME}" release-upload/* --clobber

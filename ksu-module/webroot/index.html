@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>PkgMask</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+	<div class="title">
+		<h1>PkgMask</h1>
+		<span id="verTag" class="ver"></span>
+	</div>
+	<span id="statusPill" class="pill pill-unknown">加载中…</span>
+</header>
+
+<nav id="tabs" class="tabs">
+	<button class="tab active" data-tab="pkg">隐藏包名</button>
+	<button class="tab" data-tab="status">状态与日志</button>
+	<button class="tab" data-tab="exempt">豁免设置</button>
+</nav>
+
+<main>
+	<!-- 隐藏包名 -->
+	<section id="tab-pkg" class="panel active">
+		<p class="hint">以下包在 <code>/sdcard/Android/data</code> 与 <code>/sdcard/Android/obb</code> 下的目录会被伪装成「不存在」：其他应用 stat/列举得到 ENOENT，mkdir 等写操作得到与真实不存在一致的 errno（EACCES/ENOENT）。包自身不受影响。</p>
+		<div class="row">
+			<input id="pkgInput" type="text" placeholder="com.example.app" autocapitalize="off" spellcheck="false">
+			<button id="pkgAddBtn" class="btn">添加</button>
+		</div>
+		<ul id="pkgList" class="pkg-list"></ul>
+		<p id="pkgEmpty" class="empty" hidden>暂无隐藏包名。添加后点击下方按钮生效。</p>
+	</section>
+
+	<!-- 状态与日志 -->
+	<section id="tab-status" class="panel">
+	<div id="statusCards" class="cards"></div>
+	<div class="row stat-actions">
+		<button id="diagBtn" class="btn">复制诊断报告</button>
+	</div>
+	<div class="logbox">
+		<div class="loghead">
+			<span>服务日志（最近 120 行）</span>
+			<button id="refreshLogBtn" class="btn btn-sm">刷新</button>
+		</div>
+		<pre id="logView" class="log">…</pre>
+	</div>
+		<div class="logbox">
+			<div class="loghead"><span>dmesg（pkgmask 相关，最近 40 行）</span></div>
+			<pre id="dmesgView" class="log">…</pre>
+		</div>
+	</section>
+
+	<!-- 豁免设置 -->
+	<section id="tab-exempt" class="panel">
+		<p class="hint">豁免的应用可以正常看到隐藏包目录（如你信任的文件管理器）。被隐藏的包自身与系统关键 UID 始终自动豁免。</p>
+		<label class="field">豁免应用包名（每行一个）</label>
+		<textarea id="exemptPkgText" rows="4" autocapitalize="off" spellcheck="false"></textarea>
+		<label class="field">额外豁免 UID（每行一个，一般留空）</label>
+		<textarea id="exemptUidText" rows="3" autocapitalize="off" spellcheck="false"></textarea>
+		<label class="field">系统 UID（模块目录 system_uids.conf，只读）</label>
+		<pre id="systemUidView" class="log sysuids">…</pre>
+	</section>
+</main>
+
+<footer>
+	<span id="statusText" class="statustext"></span>
+	<button id="saveReloadBtn" class="btn btn-primary">保存并热重载</button>
+</footer>
+
+<div id="toast" class="toast" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>
