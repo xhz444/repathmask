@@ -1,6 +1,6 @@
 id=pathmask
 name=PathMask Fusion (ProcGuard + Scene + PkgMask)
-version=v1.1.0
-versionCode=60
+version=v1.2.0
+versionCode=61
 author=Andrea-lyz (kernel core); fusion packaging by PkgMask
-description=三合一：procguard.ko（隔离进程 /proc 防护，带重试与 vermagic 预检）+ Scene /dev debugfs 监视（装了 Scene 才启动）+ PkgMask 包名存在性伪装（/sdcard/Android 目录读写侧完整画像，WebUI 管理）。直接覆盖升级旧的 pathmask 模块
+description=三合一：procguard.ko（隔离进程 /proc 防护，带重试与 vermagic 诊断）+ Scene /dev debugfs 监视（装了 Scene 才启动）+ PkgMask 包名存在性伪装（含 ino=0 防误伤修复与四别名匹配，WebUI 管理）。直接覆盖升级旧的 pathmask 模块

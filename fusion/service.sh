@@ -441,7 +441,9 @@ while IFS= read -r pkg; do
 		owner_uid=""
 	done
 	if [ -z "$owner_uid" ]; then
-		owner_uid=$(dumpsys package "$pkg" 2>/dev/null | grep -m 1 -o 'userId=[0-9]*' | cut -d= -f2)
+		# dumpsys can take seconds per unknown package and makes the
+		# WebUI hot reload feel hung -- bound it (toybox timeout).
+		owner_uid=$(timeout 5 dumpsys package "$pkg" 2>/dev/null | grep -m 1 -o 'userId=[0-9]*' | cut -d= -f2)
 	fi
 
 	paths_added=0

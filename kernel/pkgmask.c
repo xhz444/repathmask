@@ -146,6 +146,24 @@ struct hidden_target {
 	dev_t dev;
 	unsigned long long ino;
 	char path[TARGET_TEXT_LEN];
+	/*
+	 * False when the inode was not materialised at insmod time
+	 * (i_ino == 0, happens on FUSE before the daemon fills the
+	 * node). Matching by (ino=0, dev) would hit every not-yet-
+	 * materialised inode on that filesystem, so such targets are
+	 * hidden via the path-based syscall hooks only. (upstream e846f2e)
+	 */
+	bool inode_ok;
+	/*
+	 * Shared-storage alias state: when the target lives under a
+	 * storage root (/storage/emulated/0 etc.), string matching tries
+	 * every discovered root spelling (see pm_storage_roots) instead
+	 * of only the configured one, so /sdcard/X and
+	 * /storage/emulated/0/X hide identically. (upstream 98274c8)
+	 */
+	bool under_storage;
+	size_t storage_suffix_off;
+	size_t storage_suffix_len;
 };
 
 static struct hidden_target targets[MAX_HIDE_TARGETS];
@@ -167,6 +185,30 @@ MODULE_PARM_DESC(resolved_count,
 static enum pkgmask_scope_mode active_scope = SCOPE_GLOBAL;
 static uid_t deny_uid_list[MAX_DENY_UIDS];
 static unsigned int deny_uid_count;
+
+/*
+ * Android shared storage is reachable through several alias paths
+ * (/storage/emulated/0, /sdcard, /storage/self/primary, /mnt/sdcard).
+ * The path-string hooks only match the literal spelling an app passes,
+ * so a target configured as /storage/emulated/0/X would stay visible
+ * via /sdcard/X. At load time we resolve the candidate roots and keep
+ * the ones that hit the same (dev, ino) object as the canonical root;
+ * targets under a storage root are then matched against every spelling.
+ */
+#define PM_STORAGE_CANDIDATES 4
+
+static const char *const pm_storage_candidates[PM_STORAGE_CANDIDATES] = {
+	"/storage/emulated/0",
+	"/storage/self/primary",
+	"/sdcard",
+	"/mnt/sdcard",
+};
+
+static struct pm_storage_root {
+	char path[TARGET_TEXT_LEN];
+	size_t len;
+} pm_storage_roots[PM_STORAGE_CANDIDATES];
+static unsigned int pm_storage_root_count;
 
 typedef int (*pm_kern_path_t)(const char *name, unsigned int flags,
 			      struct path *path);
@@ -267,6 +309,8 @@ static inline bool is_target_inode(const struct inode *inode)
 		return false;
 
 	for (i = 0; i < target_count; i++) {
+		if (!targets[i].inode_ok)
+			continue;
 		if (inode->i_ino == targets[i].ino &&
 		    inode->i_sb->s_dev == targets[i].dev)
 			return true;
@@ -280,6 +324,8 @@ static inline bool is_target_ino(__u64 ino)
 	unsigned int i;
 
 	for (i = 0; i < target_count; i++) {
+		if (!targets[i].inode_ok)
+			continue;
 		if (ino == (__u64)targets[i].ino)
 			return true;
 	}
@@ -433,11 +479,70 @@ static int parse_deny_uids(void)
 	return 0;
 }
 
+static void discover_storage_aliases(void)
+{
+	struct path path;
+	dev_t canon_dev = 0;
+	unsigned long long canon_ino = 0;
+	bool canon_set = false;
+	unsigned int i;
+
+	pm_storage_root_count = 0;
+
+	if (!pm_kern_path || !pm_path_put)
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(pm_storage_candidates); i++) {
+		struct inode *inode;
+		int ret;
+
+		ret = pm_invoke_kern_path(pm_storage_candidates[i],
+					  LOOKUP_FOLLOW, &path);
+		if (ret)
+			continue;
+
+		inode = d_inode(path.dentry);
+		if (!inode || !inode->i_sb) {
+			pm_invoke_path_put(&path);
+			continue;
+		}
+
+		if (!canon_set) {
+			canon_dev = inode->i_sb->s_dev;
+			canon_ino = inode->i_ino;
+			canon_set = true;
+		} else if (inode->i_sb->s_dev != canon_dev ||
+			   inode->i_ino != canon_ino) {
+			pm_invoke_path_put(&path);
+			continue;
+		}
+		pm_invoke_path_put(&path);
+
+		strscpy(pm_storage_roots[pm_storage_root_count].path,
+			pm_storage_candidates[i],
+			sizeof(pm_storage_roots[pm_storage_root_count].path));
+		pm_storage_roots[pm_storage_root_count].len =
+			strlen(pm_storage_candidates[i]);
+		pm_storage_root_count++;
+	}
+
+	if (pm_storage_root_count > 1) {
+		pr_info(PM_LOG_PREFIX "%u storage alias root(s) active\n",
+			pm_storage_root_count - 1);
+	}
+	if (pm_storage_root_count == 0) {
+		pr_warn(PM_LOG_PREFIX
+			"no shared-storage alias root resolved (count=%u)\n",
+			pm_storage_root_count);
+	}
+}
+
 static int add_target_path(const char *path_name)
 {
 	struct path path;
 	struct inode *inode;
 	int ret;
+	unsigned int i;
 
 	if (target_count >= MAX_HIDE_TARGETS) {
 		pr_warn(PM_LOG_PREFIX "too many targets, skip %s\n", path_name);
@@ -463,8 +568,24 @@ static int add_target_path(const char *path_name)
 
 	targets[target_count].ino = inode->i_ino;
 	targets[target_count].dev = inode->i_sb->s_dev;
+	targets[target_count].inode_ok = inode->i_ino != 0;
 	strscpy(targets[target_count].path, path_name,
 		sizeof(targets[target_count].path));
+	targets[target_count].under_storage = false;
+	for (i = 0; i < pm_storage_root_count; i++) {
+		size_t rlen = pm_storage_roots[i].len;
+
+		if (strncmp(targets[target_count].path,
+			    pm_storage_roots[i].path, rlen) == 0 &&
+		    (!targets[target_count].path[rlen] ||
+		     targets[target_count].path[rlen] == '/')) {
+			targets[target_count].under_storage = true;
+			targets[target_count].storage_suffix_off = rlen;
+			targets[target_count].storage_suffix_len =
+				strlen(targets[target_count].path) - rlen;
+			break;
+		}
+	}
 	pr_info(PM_LOG_PREFIX "target[%u] %s ino=%llu dev=%u:%u\n",
 		target_count, path_name, targets[target_count].ino,
 		MAJOR(targets[target_count].dev),
@@ -662,6 +783,49 @@ struct syscall_match_data {
 
 static atomic_t pm_syscall_seen = ATOMIC_INIT(0);
 
+/*
+ * Alias-aware prefix match for one target. Targets under a shared
+ * storage root compare against every discovered root spelling, so
+ * /sdcard/X, /storage/self/primary/X and /mnt/sdcard/X all hide like
+ * the configured /storage/emulated/0/X. Non-storage targets keep the
+ * single literal-prefix rule.
+ */
+static bool pm_target_prefix_match(const char *p,
+				   const struct hidden_target *t)
+{
+	size_t plen;
+
+	if (t->under_storage) {
+		const char *suffix = t->path + t->storage_suffix_off;
+		unsigned int i;
+
+		for (i = 0; i < pm_storage_root_count; i++) {
+			size_t rlen = pm_storage_roots[i].len;
+			char next;
+
+			if (strncmp(p, pm_storage_roots[i].path, rlen))
+				continue;
+			if (strncmp(p + rlen, suffix, t->storage_suffix_len))
+				continue;
+			next = p[rlen + t->storage_suffix_len];
+			if (!next || next == '/')
+				return true;
+		}
+		return false;
+	}
+
+	plen = strlen(t->path);
+	if (!plen)
+		return false;
+	if (strncmp(p, t->path, plen) == 0) {
+		char next = p[plen];
+
+		if (!next || next == '/')
+			return true;
+	}
+	return false;
+}
+
 static bool sys_path_matches_target(const char *p)
 {
 	unsigned int i;
@@ -670,16 +834,8 @@ static bool sys_path_matches_target(const char *p)
 		return false;
 
 	for (i = 0; i < target_count; i++) {
-		size_t plen = strlen(targets[i].path);
-
-		if (!plen)
-			continue;
-		if (strncmp(p, targets[i].path, plen) == 0) {
-			char next = p[plen];
-
-			if (next == '\0' || next == '/')
-				return true;
-		}
+		if (pm_target_prefix_match(p, &targets[i]))
+			return true;
 	}
 	return false;
 }
@@ -1324,6 +1480,8 @@ static int __init pkgmask_init(void)
 		       ret);
 		return ret;
 	}
+
+	discover_storage_aliases();
 
 	ret = resolve_target_paths(paths);
 	if (ret) {

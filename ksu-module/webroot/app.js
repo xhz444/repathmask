@@ -34,15 +34,28 @@ function getKsuBridge() {
 	return null;
 }
 
-function execShell(command) {
+function execShell(command, timeoutMs = 90000) {
 	const bridge = getKsuBridge();
 	if (!bridge) return Promise.reject(new Error("KernelSU WebUI API 不可用"));
 
 	return new Promise((resolve, reject) => {
 		const callbackName = `pkgmask_exec_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+		let timer = null;
+
+		/* Timeout guard: some manager builds never invoke the exec
+		 * callback for long-running commands, which used to leave the
+		 * WebUI stuck in the busy state forever. */
+		const cleanup = () => {
+			clearTimeout(timer);
+			delete window[callbackName];
+		};
+		const fail = (err) => {
+			cleanup();
+			reject(err);
+		};
 
 		window[callbackName] = (errno, stdout, stderr) => {
-			delete window[callbackName];
+			cleanup();
 			if (errno && errno !== 0) {
 				const err = new Error(stderr || stdout || `命令失败：${errno}`);
 				err.errno = errno;
@@ -54,14 +67,19 @@ function execShell(command) {
 			resolve(stdout || "");
 		};
 
+		timer = setTimeout(() => {
+			const err = new Error(`命令超时（${Math.round(timeoutMs / 1000)} 秒），已放弃等待`);
+			err.errno = -1;
+			fail(err);
+		}, timeoutMs);
+
 		try {
 			bridge.exec(command, JSON.stringify({}), callbackName);
 		} catch {
 			try {
 				bridge.exec(command, callbackName);
 			} catch (fallbackError) {
-				delete window[callbackName];
-				reject(fallbackError);
+				fail(fallbackError);
 			}
 		}
 	});
@@ -357,17 +375,55 @@ async function saveAndReload() {
 		return;
 	}
 
-	setBusy(true, "正在保存并热重载…");
+	setBusy(true, "正在保存配置…");
 	try {
 		await writeConf(FILES.hidePackages, hidePackages);
 		await writeConf(FILES.exemptPackages, exemptPkgs);
 		await writeConf(FILES.exemptUids, exemptUids);
-		const out = await execShell(
-			`PKGMASK_RESET_FAIL_GUARD=1 PKGMASK_INITIAL_DELAY=0 PKGMASK_WAIT_SECONDS=15 sh ${shellQuote(FILES.service)} 2>&1; ` +
-			`grep -q '^pkgmask ' /proc/modules && echo MODULE_LOADED=yes || echo MODULE_LOADED=no`
+
+		/* Remember the current state timestamp, then kick the reload
+		 * DETACHED and return immediately: service.sh can legitimately
+		 * take tens of seconds (storage wait, dumpsys fallback), and a
+		 * long foreground exec is exactly what used to hang the UI. */
+		let tsBefore = 0;
+		try {
+			tsBefore = JSON.parse(await readConf(FILES.state))?.ts || 0;
+		} catch {
+			/* no state yet */
+		}
+
+		setBusy(true, "热重载已启动…");
+		await execShell(
+			`( PKGMASK_RESET_FAIL_GUARD=1 PKGMASK_INITIAL_DELAY=0 PKGMASK_WAIT_SECONDS=15 ` +
+			`sh ${shellQuote(FILES.service)} >/dev/null 2>&1 & ); echo RELOAD_STARTED`,
+			15000
 		);
-		const loaded = /MODULE_LOADED=yes/.test(out);
-		showToast(loaded ? "已热重载" : "未能加载 pkgmask，请看状态与日志");
+
+		/* Poll state.json for a fresh timestamp -- service.sh rewrites it
+		 * on every exit path (success, guard trip, load failure). */
+		const deadline = Date.now() + 45000;
+		let reloaded = false;
+		while (Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, 2000));
+			let ts = 0;
+			try {
+				ts = JSON.parse(await readConf(FILES.state))?.ts || 0;
+			} catch {
+				/* state not readable yet */
+			}
+			if (ts && ts !== tsBefore) {
+				reloaded = true;
+				break;
+			}
+			setBusy(true, `热重载进行中… 剩余 ${Math.max(1, Math.round((deadline - Date.now()) / 1000))} 秒`);
+		}
+
+		if (!reloaded) {
+			showToast("热重载仍在后台执行，稍后点「刷新」查看结果");
+		} else {
+			const modOut = await safeExec(`grep -q '^pkgmask ' /proc/modules && echo yes || echo no`);
+			showToast(modOut.trim() === "yes" ? "已热重载" : "未能加载 pkgmask，请看状态与日志");
+		}
 	} catch (error) {
 		showToast(`热重载失败：${error.message}`);
 	} finally {
