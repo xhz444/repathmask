@@ -29,6 +29,10 @@ PG_KO="$MODDIR/procguard.ko"
 SCENE_SCRIPT="$MODDIR/scene-debugfs-watch.sh"
 LOG_FILE="$CONFDIR/service.log"
 STATE_FILE="$CONFDIR/state.json"
+# Mirror status/logs into the active module directory as a fallback for
+# WebUI bridges or SELinux policies that cannot read the persistent path.
+MODULE_STATE_FILE="$MODDIR/state.json"
+MODULE_LOG_FILE="$MODDIR/service.log"
 FAIL_FILE="$CONFDIR/fail_count"
 MAX_TARGETS=128
 MAX_TARGET_CSV=16000
@@ -201,6 +205,12 @@ write_state() {
 		printf '}'
 		printf '}\n'
 	} > "$STATE_FILE.tmp" 2>/dev/null && mv "$STATE_FILE.tmp" "$STATE_FILE"
+	if [ -f "$STATE_FILE" ]; then
+		cp "$STATE_FILE" "$MODULE_STATE_FILE" 2>/dev/null || true
+	fi
+	if [ -f "$LOG_FILE" ]; then
+		cp "$LOG_FILE" "$MODULE_LOG_FILE" 2>/dev/null || true
+	fi
 
 	# Backward-compatible flat file for the previous loader package.
 	printf 'status=%s\nmodule=procguard\npath=%s\nupdated=%s\ndetail=%s\n' \

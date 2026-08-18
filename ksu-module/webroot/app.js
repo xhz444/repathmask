@@ -130,7 +130,9 @@ async function detectPaths() {
 		exemptUids: `${CONF_DIR}/exempt_uids.conf`,
 		systemUids: `${MOD_DIR}/system_uids.conf`,
 		state: `${CONF_DIR}/state.json`,
+		stateFallback: `${MOD_DIR}/state.json`,
 		log: `${CONF_DIR}/service.log`,
+		logFallback: `${MOD_DIR}/service.log`,
 		service: `${MOD_DIR}/service.sh`,
 		moduleProp: `${MOD_DIR}/module.prop`,
 	};
@@ -148,6 +150,15 @@ function parseConfLines(text) {
 async function readConf(path) {
 	const out = await safeExec(`[ -f ${shellQuote(path)} ] && cat ${shellQuote(path)} || true`);
 	return out.startsWith("ERROR:") ? "" : out;
+}
+
+async function readFirstAvailable(...paths) {
+	for (const path of paths) {
+		if (!path) continue;
+		const out = await readConf(path);
+		if (out.trim()) return { text: out, path };
+	}
+	return { text: "", path: "" };
 }
 
 /* Writing confs line-by-line keeps everything ASCII-quoted and avoids any
@@ -230,17 +241,18 @@ const SCENE_TEXT = {
 };
 
 async function refreshStatus() {
-	const [stateOut, modsOut, verOut] = await Promise.all([
-		readConf(FILES.state),
+	const [stateRead, modsOut, verOut] = await Promise.all([
+		readFirstAvailable(FILES.state, FILES.stateFallback),
 		safeExec(`grep -E '^(pkgmask|procguard) ' /proc/modules 2>/dev/null || true`),
 		readConf(FILES.moduleProp),
 	]);
 
 	let state = null;
+	let stateProblem = "";
 	try {
-		state = JSON.parse(stateOut);
-	} catch {
-		/* missing/corrupt state */
+		if (stateRead.text) state = JSON.parse(stateRead.text);
+	} catch (error) {
+		stateProblem = `状态文件无法解析（${stateRead.path}）：${error.message}`;
 	}
 
 	const fusion = Boolean(state?.fusion);
@@ -302,18 +314,21 @@ async function refreshStatus() {
 			cards += `<div class="card card-wide"><div class="card-label">内核 target（前 8 条，共 ${p.targets.length}）</div><pre class="targets">${esc(p.targets.slice(0, 8).join("\n"))}</pre></div>`;
 		}
 	} else {
-		cards += statusCard("状态", "尚无 state.json（service.sh 未运行？重启或点热重载）", "warn");
+		const message = stateProblem || `尚无 state.json（已检查 ${FILES.state} 和 ${FILES.stateFallback}）`;
+		cards += statusCard("状态", esc(message), "warn");
 	}
 	$("#statusCards").innerHTML = cards;
 }
 
 async function refreshLogs() {
-	const [logOut, dmesgOut] = await Promise.all([
-		safeExec(`[ -f ${shellQuote(FILES.log)} ] && tail -n 120 ${shellQuote(FILES.log)} || echo '(无服务日志)'`),
+	const [logRead, dmesgOut, kernelLogOut] = await Promise.all([
+		readFirstAvailable(FILES.log, FILES.logFallback),
 		safeExec(`dmesg 2>/dev/null | grep -iE 'pkgmask|procguard|scene-debugfs' | tail -n 40 || true`),
+		safeExec(`logcat -b kernel -d 2>/dev/null | grep -iE 'pkgmask|procguard|scene-debugfs' | tail -n 40 || true`),
 	]);
-	$("#logView").textContent = logOut || "(空)";
-	$("#dmesgView").textContent = dmesgOut || "(无相关 dmesg)";
+	$("#logView").textContent = logRead.text || "(无服务日志)";
+	const kernelLog = dmesgOut.trim() || kernelLogOut.trim();
+	$("#dmesgView").textContent = kernelLog || "(无内核日志，可能受 dmesg_restrict 限制)";
 }
 
 /* ---- diagnostic report ------------------------------------------------------ */
