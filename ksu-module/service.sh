@@ -28,15 +28,24 @@ MAX_TARGETS=128
 MAX_TARGET_CSV=16000
 MAX_INSMOD_RETRIES=3
 
-MODULE_VERSION=$(sed -n 's/^version=//p' "$MODDIR/module.prop" 2>/dev/null | head -n 1)
+MODULE_VERSION=$(sed -n 's/^version=//p' "$MODDIR/module.prop" 2>/dev/null | tr -d '\r' | head -n 1)
 
 log() {
 	echo "$(date '+%m-%d %H:%M:%S') $*" >> "$LOG_FILE"
 }
 
 json_escape() {
-	# Values here are restricted to [A-Za-z0-9._:/-] but stay defensive.
-	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+	# JSON strings must not contain raw control characters.
+	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\r/\\r/g' -e 's/\t/\\t/g'
+}
+
+append_pkg_status() {
+	if [ -n "$PKG_STATUS_JSON" ]; then
+		PKG_STATUS_JSON="$PKG_STATUS_JSON
+$1"
+	else
+		PKG_STATUS_JSON="$1"
+	fi
 }
 
 json_field_escape() {
@@ -153,11 +162,14 @@ write_state() {
 		printf '],'
 		printf '"packages":['
 		first=1
-		for entry in $PKG_STATUS_JSON; do
+		while IFS= read -r entry || [ -n "$entry" ]; do
+			[ -n "$entry" ] || continue
 			[ $first -eq 1 ] || printf ','
 			printf '%s' "$entry"
 			first=0
-		done
+		done <<EOF
+$PKG_STATUS_JSON
+EOF
 		printf '],'
 		printf '"targets":['
 		first=1
@@ -357,7 +369,7 @@ while IFS= read -r pkg; do
 	[ -n "$pkg" ] || continue
 	if ! valid_package_name "$pkg"; then
 		log "ignore invalid package name: $pkg"
-		PKG_STATUS_JSON="$PKG_STATUS_JSON {\"package\":\"$(json_field_escape "$pkg")\",\"status\":\"invalid-name\"}"
+		append_pkg_status "{\"package\":\"$(json_field_escape "$pkg")\",\"status\":\"invalid-name\"}"
 		continue
 	fi
 
@@ -381,20 +393,20 @@ while IFS= read -r pkg; do
 
 	if [ "$paths_added" -eq 0 ]; then
 		log "package $pkg: no Android/data|obb dirs found (not installed or not yet created) -- nothing to hide"
-		PKG_STATUS_JSON="$PKG_STATUS_JSON {\"package\":\"$(json_field_escape "$pkg")\",\"status\":\"not-installed\"}"
+		append_pkg_status "{\"package\":\"$(json_field_escape "$pkg")\",\"status\":\"not-installed\"}"
 		continue
 	fi
 
 	if [ -n "$owner_uid" ]; then
 		add_exempt_uid "$owner_uid"
 		log "hide package $pkg (owner uid $owner_uid): $paths_added path(s)"
-		PKG_STATUS_JSON="$PKG_STATUS_JSON {\"package\":\"$(json_field_escape "$pkg")\",\"status\":\"hidden\",\"uid\":$owner_uid,\"paths\":$paths_added}"
+		append_pkg_status "{\"package\":\"$(json_field_escape "$pkg")\",\"status\":\"hidden\",\"uid\":$owner_uid,\"paths\":$paths_added}"
 	else
 		# No owner uid resolved: hide anyway, but the app itself may see
 		# its own dirs as missing until reload. Rare (package list changed
 		# mid-boot); surfaced in the WebUI status.
 		log "hide package $pkg: $paths_added path(s) (owner uid NOT resolved!)"
-		PKG_STATUS_JSON="$PKG_STATUS_JSON {\"package\":\"$(json_field_escape "$pkg")\",\"status\":\"hidden-no-owner-uid\",\"paths\":$paths_added}"
+		append_pkg_status "{\"package\":\"$(json_field_escape "$pkg")\",\"status\":\"hidden-no-owner-uid\",\"paths\":$paths_added}"
 	fi
 done <<EOF
 $(read_conf_lines "$CONFDIR/hide_packages.conf")
