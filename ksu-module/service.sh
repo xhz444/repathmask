@@ -65,6 +65,53 @@ valid_package_name() {
 	esac
 }
 
+package_to_uid_from_packages_list() {
+	_pkg="$1"
+	[ -f /data/system/packages.list ] || return 0
+	while IFS= read -r _line || [ -n "$_line" ]; do
+		set -- $_line
+		[ "$1" = "$_pkg" ] || continue
+		case "$2" in
+			''|*[!0-9]*) return 0 ;;
+			*) printf '%s\n' "$2"; return 0 ;;
+		esac
+	done < /data/system/packages.list
+}
+
+package_to_uid_from_pm() {
+	_pkg="$1"
+	_output="$(
+		timeout 5 cmd package list packages --user 0 -U "$_pkg" 2>/dev/null || true
+		timeout 5 pm list packages --user 0 -U "$_pkg" 2>/dev/null || true
+	)"
+	printf '%s\n' "$_output" | while IFS= read -r _line; do
+		case "$_line" in package:*" uid:"*) ;; *) continue ;; esac
+		_found_pkg=${_line#package:}; _found_pkg=${_found_pkg%% uid:*}
+		_found_uid=${_line##* uid:}; _found_uid=${_found_uid%% *}
+		[ "$_found_pkg" = "$_pkg" ] || continue
+		case "$_found_uid" in ''|*[!0-9]*) ;; *) printf '%s\n' "$_found_uid"; break ;; esac
+	done
+}
+
+package_to_uid_from_data_dir() {
+	_pkg="$1"
+	for _dir in "/data/user/0/$_pkg" "/data/data/$_pkg"; do
+		[ -d "$_dir" ] || continue
+		_uid=$(stat -c '%u' "$_dir" 2>/dev/null || true)
+		case "$_uid" in ''|*[!0-9]*) ;; *) printf '%s\n' "$_uid"; return 0 ;; esac
+		_info=$(ls -ldn "$_dir" 2>/dev/null || true); set -- $_info
+		case "$3" in ''|*[!0-9]*) ;; *) printf '%s\n' "$3"; return 0 ;; esac
+	done
+}
+
+package_to_uid() {
+	_uid=$(package_to_uid_from_packages_list "$1" | head -n 1)
+	[ -n "$_uid" ] && { printf '%s\n' "$_uid"; return; }
+	_uid=$(package_to_uid_from_pm "$1" | head -n 1)
+	[ -n "$_uid" ] && { printf '%s\n' "$_uid"; return; }
+	package_to_uid_from_data_dir "$1" | head -n 1
+}
+
 write_state() {
 	# write_state <loaded> <resolved> <target_count> <detail>
 	_loaded="$1"; _resolved="$2"; _tcount="$3"; _detail="$(json_escape "$4")"
@@ -134,6 +181,14 @@ for conf in hide_packages.conf exempt_packages.conf exempt_uids.conf system_uids
 		log "seeded $CONFDIR/$conf from module template"
 	fi
 done
+
+# Progress marker so the WebUI never reports "尚无 state.json" while a
+# (possibly slow) load is in flight; overwritten with the real result at
+# every exit path below.
+EXEMPT_UIDS=""
+PKG_STATUS_JSON=""
+TARGET_LIST=""
+write_state false 0 0 "service 运行中（正在加载，稍候刷新查看结果）"
 
 # ---- failure guard ---------------------------------------------------------
 if [ "${PKGMASK_RESET_FAIL_GUARD:-0}" = "1" ]; then
@@ -271,18 +326,15 @@ for u in $(read_conf_lines "$CONFDIR/exempt_uids.conf"); do
 	esac
 done
 
-# Exempt packages: resolve their uid via /data/user/<n>/<pkg> ownership.
+# Exempt packages: resolve UID from the package database first. Shared
+# storage backing directories are commonly owned by media_rw (1023), not
+# the app, so they must never be used as an app-UID oracle.
 for p in $(read_conf_lines "$CONFDIR/exempt_packages.conf"); do
 	if ! valid_package_name "$p"; then
 		log "ignore invalid exempt package name: $p"
 		continue
 	fi
-	puid=""
-	for d in /data/user/*/"$p" /data/data/"$p"; do
-		[ -d "$d" ] || continue
-		puid=$(stat -c '%u' "$d" 2>/dev/null) && [ -n "$puid" ] && break
-		puid=""
-	done
+	puid=$(package_to_uid "$p")
 	if [ -n "$puid" ]; then
 		add_exempt_uid "$puid"
 		log "exempt package $p -> uid $puid"
@@ -299,22 +351,11 @@ while IFS= read -r pkg; do
 		continue
 	fi
 
-	# Owner uid: stat the real (non-FUSE) backing dir (works for every
-	# user profile via the /data/media/N glob); fall back to dumpsys.
-	owner_uid=""
-	for d in /data/media/*/Android/data/"$pkg"; do
-		[ -d "$d" ] || continue
-		owner_uid=$(stat -c '%u' "$d" 2>/dev/null)
-		[ -n "$owner_uid" ] && break
-		owner_uid=""
-	done
-	if [ -z "$owner_uid" ]; then
-		# dumpsys can take seconds per unknown package and makes the
-		# WebUI hot reload feel hung -- bound it. `timeout` exists in
-		# toybox (Android 8+); if missing the substitution is empty
-		# and the caller logs hidden-no-owner-uid.
-		owner_uid=$(timeout 5 dumpsys package "$pkg" 2>/dev/null | grep -m 1 -o 'userId=[0-9]*' | cut -d= -f2)
-	fi
+	# Resolve the real app UID from packages.list / PackageManager /
+	# private data-dir ownership. Never use /data/media ownership here:
+	# on many ROMs it is media_rw (1023), which would leave the hidden
+	# app itself unexempt and break its File.mkdirs()/media loading.
+	owner_uid=$(package_to_uid "$pkg")
 
 	paths_added=0
 	for prefix in $PREFIXES; do

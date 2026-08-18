@@ -138,6 +138,17 @@ MODULE_PARM_DESC(write_op_policy,
 
 static enum pkgmask_write_op_policy active_write_policy = WRITE_OP_EACCES;
 
+/*
+ * Runtime-toggleable rewrite logger (/sys/module/pkgmask/parameters/
+ * debug_rewrites). When enabled, every hidden-path errno rewrite logs
+ * path + resulting errno + uid, ratelimited. Meant for diagnosing
+ * overbroad matches (e.g. sibling paths that should stay native).
+ */
+static bool debug_rewrites;
+module_param(debug_rewrites, bool, 0644);
+MODULE_PARM_DESC(debug_rewrites,
+	"Log every hidden-path errno rewrite (path, errno, uid) to dmesg, ratelimited. Toggle live via sysfs, no reload needed.");
+
 static char deny_uids[UID_LIST_LEN];
 module_param_string(deny_uids, deny_uids, sizeof(deny_uids), 0644);
 MODULE_PARM_DESC(deny_uids, "Comma-separated scope UIDs: hidden in deny mode, exempt in allow mode");
@@ -689,9 +700,15 @@ static inline void pm_apply_hide_errno(struct pt_regs *regs)
 	if (pm_is_write_class_syscall()) {
 		switch (active_write_policy) {
 		case WRITE_OP_PASSTHROUGH:
-			return;
 		case WRITE_OP_EACCES:
-			regs_set_return_value(regs, -EACCES);
+			/*
+			 * Do not shape writes at inode level. FUSE/OEM filesystems
+			 * may reuse placeholder inode identities across sibling
+			 * package directories, so changing errno here can turn an
+			 * unrelated installed sibling's native ENOENT into EACCES.
+			 * The dedicated syscall hooks below perform exact pathname
+			 * matching and apply the absent profile safely.
+			 */
 			return;
 		case WRITE_OP_ENOENT:
 			break;
@@ -779,6 +796,7 @@ struct syscall_match_data {
 	bool matched;
 	bool needs_close;
 	long err;
+	char path[TARGET_TEXT_LEN];
 };
 
 static atomic_t pm_syscall_seen = ATOMIC_INIT(0);
@@ -795,6 +813,12 @@ static bool pm_target_prefix_match(const char *p,
 {
 	size_t plen;
 
+	if (!p || !t)
+		return false;
+	plen = strnlen(p, TARGET_TEXT_LEN);
+	if (plen >= TARGET_TEXT_LEN)
+		return false;
+
 	if (t->under_storage) {
 		const char *suffix = t->path + t->storage_suffix_off;
 		unsigned int i;
@@ -803,6 +827,10 @@ static bool pm_target_prefix_match(const char *p,
 			size_t rlen = pm_storage_roots[i].len;
 			char next;
 
+			if (rlen > plen)
+				continue;
+			if (t->storage_suffix_len > plen - rlen)
+				continue;
 			if (strncmp(p, pm_storage_roots[i].path, rlen))
 				continue;
 			if (strncmp(p + rlen, suffix, t->storage_suffix_len))
@@ -815,7 +843,7 @@ static bool pm_target_prefix_match(const char *p,
 	}
 
 	plen = strlen(t->path);
-	if (!plen)
+	if (!plen || plen > strnlen(p, TARGET_TEXT_LEN))
 		return false;
 	if (strncmp(p, t->path, plen) == 0) {
 		char next = p[plen];
@@ -847,9 +875,12 @@ static bool sys_path_matches_target(const char *p)
  * `kretprobe_instance` has no portable `rp` field across the 5.10 / 5.15+
  * KMI lines (5.15 introduced an `rph` indirection and `get_kretprobe()`,
  * neither exists on 5.10), so each syscall kind gets its own thin entry
- * handler that just sets `needs_close` correctly.
+ * handler that just sets `needs_close` correctly. On match the user path
+ * is copied into the instance data so the exit handler can log it when
+ * debug_rewrites is on.
  */
-static bool sys_path_match_user_filename(struct pt_regs *regs)
+static bool sys_path_match_user_filename(struct pt_regs *regs,
+					 struct syscall_match_data *d)
 {
 	struct pt_regs *user_regs = (struct pt_regs *)regs->regs[0];
 	char buf[TARGET_TEXT_LEN];
@@ -869,7 +900,12 @@ static bool sys_path_match_user_filename(struct pt_regs *regs)
 		return false;
 	buf[sizeof(buf) - 1] = '\0';
 
-	return sys_path_matches_target(buf);
+	if (!sys_path_matches_target(buf))
+		return false;
+
+	if (d)
+		strscpy(d->path, buf, sizeof(d->path));
+	return true;
 }
 
 static int sys_path_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
@@ -879,8 +915,9 @@ static int sys_path_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	d->matched = false;
 	d->needs_close = false;
 	d->err = -ENOENT;
+	d->path[0] = '\0';
 
-	if (!sys_path_match_user_filename(regs))
+	if (!sys_path_match_user_filename(regs, d))
 		return 0;
 
 	d->matched = true;
@@ -897,6 +934,7 @@ static int sys_openat_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	d->matched = false;
 	d->needs_close = false;
 	d->err = -ENOENT;
+	d->path[0] = '\0';
 
 	/*
 	 * For openat we can only fake -ENOENT if we also have a way to
@@ -907,7 +945,7 @@ static int sys_openat_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	if (!pm_close_fd)
 		return 0;
 
-	if (!sys_path_match_user_filename(regs))
+	if (!sys_path_match_user_filename(regs, d))
 		return 0;
 
 	d->matched = true;
@@ -944,11 +982,12 @@ static int sys_openat2_entry(struct kretprobe_instance *ri,
 	d->matched = false;
 	d->needs_close = false;
 	d->err = -ENOENT;
+	d->path[0] = '\0';
 
 	if (!pm_close_fd)
 		return 0;
 
-	if (!sys_path_match_user_filename(regs))
+	if (!sys_path_match_user_filename(regs, d))
 		return 0;
 
 	d->matched = true;
@@ -983,6 +1022,12 @@ static int sys_path_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 		 */
 		pm_invoke_close_fd((unsigned int)ret);
 	}
+
+	if (debug_rewrites && d->path[0])
+		pr_info_ratelimited(PM_LOG_PREFIX
+				    "rewrite(read) %s -> %ld uid=%u\n",
+				    d->path, d->err,
+				    __kuid_val(current_uid()));
 
 	regs_set_return_value(regs, d->err);
 	return 0;
@@ -1178,11 +1223,13 @@ static void unregister_syscall_hooks(void)
 struct write_syscall_data {
 	bool matched;
 	long err;
+	char path[TARGET_TEXT_LEN];
 };
 
 static atomic_t pm_write_seen = ATOMIC_INIT(0);
 
-static bool sys_path_match_user_reg(struct pt_regs *regs, unsigned int regno)
+static bool sys_path_match_user_reg(struct pt_regs *regs, unsigned int regno,
+				    char *matched_path)
 {
 	struct pt_regs *user_regs = (struct pt_regs *)regs->regs[0];
 	char buf[TARGET_TEXT_LEN];
@@ -1198,7 +1245,11 @@ static bool sys_path_match_user_reg(struct pt_regs *regs, unsigned int regno)
 		return false;
 	buf[sizeof(buf) - 1] = '\0';
 
-	return sys_path_matches_target(buf);
+	if (!sys_path_matches_target(buf))
+		return false;
+	if (matched_path)
+		strscpy(matched_path, buf, TARGET_TEXT_LEN);
+	return true;
 }
 
 static void write_match_log_once(void)
@@ -1213,7 +1264,8 @@ static int sys_mkdirat_entry(struct kretprobe_instance *ri,
 {
 	struct write_syscall_data *d = (struct write_syscall_data *)ri->data;
 
-	d->matched = sys_path_match_user_reg(regs, 1);
+	d->path[0] = '\0';
+	d->matched = sys_path_match_user_reg(regs, 1, d->path);
 	d->err = -EACCES;
 	if (d->matched)
 		write_match_log_once();
@@ -1225,7 +1277,8 @@ static int sys_unlinkat_entry(struct kretprobe_instance *ri,
 {
 	struct write_syscall_data *d = (struct write_syscall_data *)ri->data;
 
-	d->matched = sys_path_match_user_reg(regs, 1);
+	d->path[0] = '\0';
+	d->matched = sys_path_match_user_reg(regs, 1, d->path);
 	d->err = -ENOENT;
 	if (d->matched)
 		write_match_log_once();
@@ -1244,11 +1297,12 @@ static int sys_two_path_entry(struct kretprobe_instance *ri,
 
 	d->matched = false;
 	d->err = 0;
+	d->path[0] = '\0';
 
-	if (sys_path_match_user_reg(regs, 1)) {
+	if (sys_path_match_user_reg(regs, 1, d->path)) {
 		d->matched = true;
 		d->err = -ENOENT;
-	} else if (sys_path_match_user_reg(regs, 3)) {
+	} else if (sys_path_match_user_reg(regs, 3, d->path)) {
 		d->matched = true;
 		d->err = -EACCES;
 	}
@@ -1267,7 +1321,8 @@ static int sys_symlinkat_entry(struct kretprobe_instance *ri,
 {
 	struct write_syscall_data *d = (struct write_syscall_data *)ri->data;
 
-	d->matched = sys_path_match_user_reg(regs, 2);
+	d->path[0] = '\0';
+	d->matched = sys_path_match_user_reg(regs, 2, d->path);
 	d->err = -EACCES;
 	if (d->matched)
 		write_match_log_once();
@@ -1278,8 +1333,14 @@ static int sys_write_exit(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct write_syscall_data *d = (struct write_syscall_data *)ri->data;
 
-	if (d->matched)
+	if (d->matched) {
+		if (debug_rewrites && d->path[0])
+			pr_info_ratelimited(PM_LOG_PREFIX
+					    "rewrite(write) %s -> %ld uid=%u\n",
+					    d->path, d->err,
+					    __kuid_val(current_uid()));
 		regs_set_return_value(regs, d->err);
+	}
 	return 0;
 }
 

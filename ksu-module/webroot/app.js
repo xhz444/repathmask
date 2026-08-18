@@ -103,11 +103,11 @@ function showToast(message) {
 	}, 4200);
 }
 
-function setBusy(nextBusy, message) {
+function setBusy(nextBusy, message = null) {
 	busy = nextBusy;
 	$("#saveReloadBtn").disabled = nextBusy;
 	$("#pkgAddBtn").disabled = nextBusy;
-	if (message) $("#statusText").textContent = message;
+	if (message !== null) $("#statusText").textContent = message;
 }
 
 /* ---- path detection ------------------------------------------------------ */
@@ -375,57 +375,33 @@ async function saveAndReload() {
 		return;
 	}
 
-	setBusy(true, "正在保存配置…");
+	setBusy(true, "正在保存并热重载…");
 	try {
 		await writeConf(FILES.hidePackages, hidePackages);
 		await writeConf(FILES.exemptPackages, exemptPkgs);
 		await writeConf(FILES.exemptUids, exemptUids);
 
-		/* Remember the current state timestamp, then kick the reload
-		 * DETACHED and return immediately: service.sh can legitimately
-		 * take tens of seconds (storage wait, dumpsys fallback), and a
-		 * long foreground exec is exactly what used to hang the UI. */
-		let tsBefore = 0;
-		try {
-			tsBefore = JSON.parse(await readConf(FILES.state))?.ts || 0;
-		} catch {
-			/* no state yet */
-		}
-
-		setBusy(true, "热重载已启动…");
-		await execShell(
-			`( PKGMASK_RESET_FAIL_GUARD=1 PKGMASK_INITIAL_DELAY=0 PKGMASK_WAIT_SECONDS=15 ` +
-			`sh ${shellQuote(FILES.service)} >/dev/null 2>&1 & ); echo RELOAD_STARTED`,
-			15000
+		/* Foreground single exec, same shape as the original project's
+		 * reload: rmmod first (with guard), short storage wait, then
+		 * service.sh, then the load check. The detached variant used
+		 * before turned out to get reaped by the manager's exec cleanup,
+		 * which is why the countdown never finished. The 75s JS timeout
+		 * below is the last-resort guard so the UI can never hang. */
+		const out = await execShell(
+			`if grep -q '^pkgmask ' /proc/modules 2>/dev/null; then rmmod pkgmask || exit 20; fi; ` +
+			`PKGMASK_RESET_FAIL_GUARD=1 PKGMASK_INITIAL_DELAY=0 PKGMASK_WAIT_SECONDS=5 ` +
+			`sh ${shellQuote(FILES.service)} 2>&1 | tail -n 15; ` +
+			`grep -q '^pkgmask ' /proc/modules && echo MODULE_LOADED=yes || echo MODULE_LOADED=no`,
+			75000
 		);
-
-		/* Poll state.json for a fresh timestamp -- service.sh rewrites it
-		 * on every exit path (success, guard trip, load failure). */
-		const deadline = Date.now() + 45000;
-		let reloaded = false;
-		while (Date.now() < deadline) {
-			await new Promise((r) => setTimeout(r, 2000));
-			let ts = 0;
-			try {
-				ts = JSON.parse(await readConf(FILES.state))?.ts || 0;
-			} catch {
-				/* state not readable yet */
-			}
-			if (ts && ts !== tsBefore) {
-				reloaded = true;
-				break;
-			}
-			setBusy(true, `热重载进行中… 剩余 ${Math.max(1, Math.round((deadline - Date.now()) / 1000))} 秒`);
-		}
-
-		if (!reloaded) {
-			showToast("热重载仍在后台执行，稍后点「刷新」查看结果");
-		} else {
-			const modOut = await safeExec(`grep -q '^pkgmask ' /proc/modules && echo yes || echo no`);
-			showToast(modOut.trim() === "yes" ? "已热重载" : "未能加载 pkgmask，请看状态与日志");
-		}
+		const loaded = /MODULE_LOADED=yes/.test(out);
+		showToast(loaded ? "已热重载" : "未能加载 pkgmask，请看状态与日志");
 	} catch (error) {
-		showToast(`热重载失败：${error.message}`);
+		if (error.errno === 20) {
+			showToast("rmmod 失败，旧实例仍在；请稍后重试或重启");
+		} else {
+			showToast(`热重载失败：${error.message}`);
+		}
 	} finally {
 		setBusy(false, "");
 		await refreshStatus();
